@@ -23,7 +23,7 @@
 #include "defines.h"
 
 /*================================ Define & Const ==============================*/
-#define BMP280_ADDR 0x76 // 7-bit address
+#define BMP280_ADDR 0xEC // 7-bit address
 
 #define BMP280_REG_CONTROL 0xF4
 #define BMP280_REG_RESULT_PRESSURE 0xF7     // 0xF7(msb) , 0xF8(lsb) , 0xF9(xlsb) : stores the pressure data.
@@ -60,11 +60,11 @@
 #define SAMPLING_X16 0x05
 
 /** Sleep mode. */
-#define MODE_SLEEP 0x00,
+#define MODE_SLEEP 0x00
 /** Forced mode. */
-#define MODE_FORCED 0x01,
+#define MODE_FORCED 0x01
 /** Normal mode. */
-#define MODE_NORMAL 0x03,
+#define MODE_NORMAL 0x03
 /** Software reset. */
 #define MODE_SOFT_RESET_CODE 0xB6
 
@@ -80,21 +80,28 @@
 #define FILTER_X16 0x04
 
 /** 1 ms standby. */
-#define STANDBY_MS_1 0x00,
+#define STANDBY_MS_1 0x00
 /** 62.5 ms standby. */
-#define STANDBY_MS_63 0x01,
+#define STANDBY_MS_63 0x01
 /** 125 ms standby. */
-#define STANDBY_MS_125 0x02,
+#define STANDBY_MS_125 0x02
 /** 250 ms standby. */
-#define STANDBY_MS_250 0x03,
+#define STANDBY_MS_250 0x03
 /** 500 ms standby. */
-#define STANDBY_MS_500 0x04,
+#define STANDBY_MS_500 0x04
 /** 1000 ms standby. */
-#define STANDBY_MS_1000 0x05,
+#define STANDBY_MS_1000 0x05
 /** 2000 ms standby. */
-#define STANDBY_MS_2000 0x06,
+#define STANDBY_MS_2000 0x06
 /** 4000 ms standby. */
 #define STANDBY_MS_4000 0x07
+
+#define BLOCK_SIZE 5			  //The smaller amount of data we are going to filter is 100Hz read / 20 Hz transmitted
+#define NUM_TAPS 10				  //we are going to use 10 coeffs in the filter
+#define sampleWindow 5			  //when we do the mean, we do it of a sample window of 5, as specified in the problem
+#define Data_Filtering_Amount 20  //sampling acc at 100Hz and streaming at 5Hz, we get 20 values from acc
+#define Result_Filtering_Amount 5 //sampling acc at 100Hz and streaming at 20Hz, we get 5 values from acc
+
 
 /*================================ Function prototypes ==============================*/
 void i2c_initialize(void);
@@ -115,6 +122,7 @@ void readUInt(uint8_t address, double *value);
 void readBytes(uint8_t values[], uint8_t length);
 void writeBytes(uint8_t values[], uint8_t length);
 void getUnPT(double *uP, double *uT);
+void BMP280_read(uint8_t data[], uint8_t lenght);
 
 /*================================ Global Variable ==============================*/
 double dig_T1, dig_T2, dig_T3, dig_T4, dig_P1, dig_P2, dig_P3, dig_P4, dig_P5, dig_P6, dig_P7, dig_P8, dig_P9;
@@ -122,18 +130,46 @@ uint8_t oversampling, oversampling_t;
 double t_fine;
 char error;
 const double P0 = 1013.25;
+static float32_t firStateF32X[BLOCK_SIZE + NUM_TAPS - 1];
+const float32_t firCoeffs32[NUM_TAPS] = {
+	+0.01198f, +0.03259f, +0.08880f, +0.15903f,
+	+0.20758f, +0.20758f, +0.15903f, +0.08880f,
+	+0.03259f, +0.01198f};
+uint32_t blockSize = BLOCK_SIZE; //variable in uint32_t of the Block size
+
 
 /*================================ Main  ==============================*/
 
 int main()
 {
     /* Initialize */
-	i2c_initialize();
-    setOversampling(4);
+    i2c_initialize();
+    /* Initialize bmo280 */
+    bmp280_initialize();
+    setOversampling(SAMPLING_X4);
     readCalibration();
 
+    int i, k = 0;																		//variables that will act as counters for loops
+    	arm_fir_instance_f32 Fir_Instance_X_Axi; //instances of the filter
+    	int BUFFER_ACC_AXIS = Data_Filtering_Amount;										//the maximum amount of data obtained from the accumulator before we read it, by default we start streaming Data
+    	uint32_t numBlocks = BUFFER_ACC_AXIS / blockSize;									//number of blocks of data we need to filter, it will be 4 for Data streaming, 1 for Result streaming
+    	int16_t Data_Read_Acc[3] = {0, 0, 0};												//Auxiliary variable for the temporal data read from the accelerometer each 10ms
 
-    while (1)
+    	/* -------------------------------------------------------------------
+    	 Vectors that will act as buffers storing the data read from the accelerometer before and after passing the filter
+    	 * ------------------------------------------------------------------- */
+    	float32_t Data_Stored_X_axis[BUFFER_ACC_AXIS];
+    	float32_t Data_Stored_Filtered_X_axis[BUFFER_ACC_AXIS];
+
+    	/* -------------------------------------------------------------------
+    	 Variables that will store the planar and orientation data of the board
+    	 * ------------------------------------------------------------------- */
+    	float Orientation_X_Axis;
+
+    	/* Call FIR init function to initialize the instance structure of each axis. */
+
+
+    		while (1)
     {
         double T = 0, P = 0;
         uint8_t result = startMeasurment();
@@ -237,9 +273,6 @@ void i2c_initialize(void)
     /* Initialize Delay */
     TM_DELAY_Init();
 
-    /* Initialize bmo280 */
-    bmp280_initialize();
-
     /* Initialize Led */
     STM_EVAL_LEDInit(LED3); //Orange
     STM_EVAL_LEDInit(LED4); //Green
@@ -255,26 +288,20 @@ void i2c_initialize(void)
  *========================================================================**/
 void bmp280_initialize(void)
 {
-    uint8_t buffer_RESET[] = {BMP280_REGISTER_SOFTRESET, MODE_SOFT_RESET_CODE};
-    uint8_t buffer_MODE_NORMAL[] = {BMP280_REGISTER_CONTROL, MODE_NORMAL};
-    uint8_t buffer_SAMPLING_X2[] = {BMP280_REGISTER_CONTROL, SAMPLING_X2};
-    uint8_t buffer_SAMPLING_X16[] = {BMP280_REGISTER_CONTROL, SAMPLING_X16};
-    uint8_t buffer_FILTER_X16[] = {BMP280_REGISTER_CONFIG, FILTER_X16};
-    uint8_t buffer_STANDBY_MS_500[] = {BMP280_REGISTER_CONFIG, STANDBY_MS_500};
+    TM_I2C_Write(I2C1, BMP280_ADDR, BMP280_REGISTER_SOFTRESET, MODE_SOFT_RESET_CODE);
+    Delayms(200);
+    TM_I2C_Write(I2C1, BMP280_ADDR, BMP280_REGISTER_CONTROL, MODE_NORMAL);
+    Delayms(200);
+    TM_I2C_Write(I2C1, BMP280_ADDR, BMP280_REGISTER_CONTROL, SAMPLING_X16);
+    Delayms(200);
+    TM_I2C_Write(I2C1, BMP280_ADDR, BMP280_REGISTER_CONFIG, FILTER_X16);
+    Delayms(200);
+    TM_I2C_Write(I2C1, BMP280_ADDR, BMP280_REGISTER_CONFIG, STANDBY_MS_500);
+    Delayms(200);
 
-    //TM_I2C_WriteMultiNoRegister(I2C_TypeDef* I2Cx, uint8_t address, uint8_t* data, uint16_t count);
-    TM_I2C_WriteMultiNoRegister(I2C1, BMP280_ADDR, buffer_RESET, 2);
-    Delayms(100);
-    TM_I2C_WriteMultiNoRegister(I2C1, BMP280_ADDR, buffer_MODE_NORMAL, 2);
-    Delayms(100);
-    TM_I2C_WriteMultiNoRegister(I2C1, BMP280_ADDR, buffer_SAMPLING_X2, 2);
-    Delayms(100);
-    TM_I2C_WriteMultiNoRegister(I2C1, BMP280_ADDR, buffer_SAMPLING_X16, 2);
-    Delayms(100);
-    TM_I2C_WriteMultiNoRegister(I2C1, BMP280_ADDR, buffer_FILTER_X16, 2);
-    Delayms(100);
-    TM_I2C_WriteMultiNoRegister(I2C1, BMP280_ADDR, buffer_STANDBY_MS_500, 2);
-    Delayms(100);
+    if(TM_I2C_Read(I2C1, BMP280_ADDR, BMP280_REGISTER_CHIPID) == 0x58){
+    	STM_EVAL_LEDOn(LED6); // Blue
+    }
 }
 
 /**========================================================================
@@ -283,50 +310,48 @@ void bmp280_initialize(void)
  *? Ogni dispositivo ha numeri diversi, questi devono essere recuperati e utilizzato nei calcoli durante le misurazioni.
  *? Recupera i dati di calibrazione dal dispositivo:
  *@param null null
- *@return 1 se OK
- *@return 0 se KO
+ *@return void
  *========================================================================**/
 void readCalibration()
 {
     readUInt(0x88, &dig_T1);
     readInt(0x8A, &dig_T2);
-    readInt(0x8C, &dig_T3); readUInt(0x8E, &dig_P1);
-        readInt(0x90, &dig_P2); readInt(0x92, &dig_P3);
-        readInt(0x94, &dig_P4); readInt(0x96, &dig_P5);
-        readInt(0x98, &dig_P6); readInt(0x9A, &dig_P7);
-        readInt(0x9C, &dig_P8); readInt(0x9E, &dig_P9);
+    readInt(0x8C, &dig_T3);
+    readUInt(0x8E, &dig_P1);
+    readInt(0x90, &dig_P2);
+    readInt(0x92, &dig_P3);
+    readInt(0x94, &dig_P4);
+    readInt(0x96, &dig_P5);
+    readInt(0x98, &dig_P6);
+    readInt(0x9A, &dig_P7);
+    readInt(0x9C, &dig_P8);
+    readInt(0x9E, &dig_P9);
 
-        uint8_t _dig_T1 = dig_T1;
-        int8_t _dig_T2 = dig_T2;
-        int8_t _dig_T3 = dig_T3;
-        uint8_t _dig_P1 = dig_P1;
-        int8_t _dig_P2 = dig_P2;
-        int8_t _dig_P3 = dig_P3;
-        int8_t _dig_P4 = dig_P4;
-        int8_t _dig_P5 = dig_P5;
-        int8_t _dig_P6 = dig_P6;
-        int8_t _dig_P7 = dig_P7;
-        int8_t _dig_P8 = dig_P8;
-        int8_t _dig_P9 = dig_P9;
+    uint8_t _dig_T1 = dig_T1;
+    int8_t _dig_T2 = dig_T2;
+    int8_t _dig_T3 = dig_T3;
+    uint8_t _dig_P1 = dig_P1;
+    int8_t _dig_P2 = dig_P2;
+    int8_t _dig_P3 = dig_P3;
+    int8_t _dig_P4 = dig_P4;
+    int8_t _dig_P5 = dig_P5;
+    int8_t _dig_P6 = dig_P6;
+    int8_t _dig_P7 = dig_P7;
+    int8_t _dig_P8 = dig_P8;
+    int8_t _dig_P9 = dig_P9;
 
-
-
-
-
-
-        printf("dig_T1= %2.f\n", dig_T1);
-        printf("dig_T2= %2.f\n", dig_T2);
-        printf("dig_T3= %2.f\n", dig_T3);
-        printf("dig_P1= %2.f\n", dig_P1);
-        printf("dig_P2= %2.f\n", dig_P2);
-        printf("dig_P3= %2.f\n", dig_P3);
-        printf("dig_P4= %2.f\n", dig_P4);
-        printf("dig_P5= %2.f\n", dig_P5);
-        printf("dig_P6= %2.f\n", dig_P6);
-        printf("dig_P7= %2.f\n", dig_P7);
-        printf("dig_P8= %2.f\n", dig_P8);
-        printf("dig_P9= %2.f\n", dig_P9);
-
+    printf("dig_T1= %2.f\n", dig_T1);
+    printf("dig_T2= %2.f\n", dig_T2);
+    printf("dig_T3= %2.f\n", dig_T3);
+    printf("dig_P1= %2.f\n", dig_P1);
+    printf("dig_P2= %2.f\n", dig_P2);
+    printf("dig_P3= %2.f\n", dig_P3);
+    printf("dig_P4= %2.f\n", dig_P4);
+    printf("dig_P5= %2.f\n", dig_P5);
+    printf("dig_P6= %2.f\n", dig_P6);
+    printf("dig_P7= %2.f\n", dig_P7);
+    printf("dig_P8= %2.f\n", dig_P8);
+    printf("dig_P9= %2.f\n", dig_P9);
 }
 
 /**========================================================================
@@ -346,7 +371,7 @@ void readInt(uint8_t address, double *value)
 
     data[0] = address;
     readBytes(data, 2);
-        *value = (double)(int16_t)(((unsigned int)data[1] << 8) | (unsigned int)data[0]);
+    *value = (double)(int16_t)(((unsigned int)data[1] << 8) | (unsigned int)data[0]);
 }
 
 /**========================================================================
@@ -382,17 +407,14 @@ void readBytes(uint8_t values[], uint8_t length)
 {
     uint8_t buffer[length];
     uint8_t reg = values[0]; //registro
-    //TM_I2C_ReadMulti(I2C_TypeDef* I2Cx, uint8_t address, uint8_t reg, uint8_t *data, uint16_t count);
-    buffer[0] = TM_I2C_Read(I2C1, BMP280_ADDR, reg);
-    reg = reg + 1;
-    buffer[1] = TM_I2C_Read(I2C1, BMP280_ADDR, reg);
+    TM_I2C_ReadMulti(I2C1, BMP280_ADDR, reg, buffer, 2);
 
-        for (int i = 0; i < length; i++)
-        {
-            values[i] = buffer[i];
-            printf("values[%d] = %d\n", i, values[i]);
-            printf("buffer[%d] = %d\n", i, buffer[i]);
-        }
+    for (int i = 0; i < length; i++)
+    {
+        values[i] = buffer[i];
+        printf("values[%d] = %d\n", i, values[i]);
+        printf("buffer[%d] = %d\n", i, buffer[i]);
+    }
 }
 
 /**========================================================================
@@ -406,7 +428,7 @@ void readBytes(uint8_t values[], uint8_t length)
  *========================================================================**/
 void writeBytes(uint8_t values[], uint8_t length)
 {
-	TM_I2C_WriteMultiNoRegister(I2C1, BMP280_ADDR, values, length);
+    TM_I2C_WriteMultiNoRegister(I2C1, BMP280_ADDR, values, length);
 }
 
 /**========================================================================
@@ -482,8 +504,9 @@ uint8_t startMeasurment(void)
         delay = 9;
         break;
     }
-    //TM_I2C_WriteMultiNoRegister(I2C_TypeDef* I2Cx, uint8_t address, uint8_t* data, uint16_t count);
-    TM_I2C_WriteMultiNoRegister(I2C1, BMP280_ADDR, data, 2);
+
+    //TM_I2C_Write(I2C_TypeDef* I2Cx, uint8_t address, uint8_t reg, uint8_t data);
+    TM_I2C_Write(I2C1, BMP280_ADDR, data[0], data[1]);
     //writeBytes(data, 2);
     return (delay);
 }
@@ -501,15 +524,19 @@ void getUnPT(double *uP, double *uT)
 {
     uint8_t data[6];
 
-    data[0] = BMP280_REG_RESULT_PRESSURE; //0xF7
+    BMP280_read(data, 6);
 
-    readBytes(data, 6); // 0xF7; xF8, 0xF9, 0xFA, 0xFB, 0xFC
+    *uP = (double)(data[0] * 4096 + data[1] * 16 + data[2] / 16); //20bit UP
+    *uT = (double)(data[3] * 4096 + data[4] * 16 + data[5] / 16); //20bit UT
 
-        *uP = (double)(data[0] * 4096 + data[1] * 16 + data[2] / 16); //20bit UP
-        *uT = (double)(data[3] * 4096 + data[4] * 16 + data[5] / 16); //20bit UT
+    printf("uT: %2.f\n", *uT);
+    printf("uP: %2.f\n", *uP);
+}
 
-        printf("uT: %2.f\n", *uT);
-        printf("uP: %2.f\n", *uP);
+void BMP280_read(uint8_t data[], uint8_t lenght){
+
+	data[0] = BMP280_REG_RESULT_PRESSURE; //0xF7
+	readBytes(data, lenght); // 0xF7; xF8, 0xF9, 0xFA, 0xFB, 0xFC
 
 }
 
@@ -528,20 +555,20 @@ uint8_t getTemperatureAndPressure(double *T, double *P)
     double uP = 0;
     getUnPT(&uP, &uT);
 
-        // calculate the temperature
-        uint8_t result = calcTemperature(T, uT);
+    // calculate the temperature
+    uint8_t result = calcTemperature(T, uT);
+    if (result)
+    {
+        // calculate the pressure
+        result = calcPressure(P, uP);
         if (result)
-        {
-            // calculate the pressure
-            result = calcPressure(P, uP);
-            if (result)
-                return (1);
-            else
-                error = 3; // pressure error ;
-            return (9);
-        }
+            return (1);
         else
-            error = 2; // temperature error ;
+            error = 3; // pressure error ;
+        return (9);
+    }
+    else
+        error = 2; // temperature error ;
     return (9);
 }
 
